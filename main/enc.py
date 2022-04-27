@@ -2,10 +2,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+# import time
 import random
+import argparse
 import numpy as np
 
 from glob import glob
+from utils import *
 
 import torch
 import torch.nn as nn 
@@ -16,37 +19,44 @@ from sklearn.metrics import roc_curve
 from torch.nn.utils import clip_grad_norm_
 from scipy.optimize import brentq
 
+# GLOBAL VARS
 PAR_N_FRAMES = 160
 MODEL_EM_size = 256
 MEL_N_CHANNELS = 40
 
-
 WORKERS = torch.cuda.device_count() if torch.cuda.is_available() else os.cpu_count()
 
-save_every = 100
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+LOSS_DEVICE = torch.device("cpu")
 
-model_hidden_size = 256
-model_num_layers = 3
-learning_rate_init = 1e-4
+# ARGUMENTS
+parser = argparse.ArgumentParser()
 
-# speakers_per_batch = 64
-# utterances_per_speaker = 10
+parser.add_argument("-bdir", "--baseDir", default="../data/audio")
+parser.add_argument("-mdir", "--modelDir", default="../data/model")
 
-speakers_per_batch = 8
-utterances_per_speaker = 5
+parser.add_argument("-hs", "--hiddenSize", default=256, type=int)
+parser.add_argument("-nl", "--nlayers", default=3, type=int)
+parser.add_argument("-lr", "--learningRate", default=1e-4, type=float)
 
-epochs = 20
-version="v00"
+parser.add_argument("-spkr", "--speakersPerBatch", default=8, type=int)
+parser.add_argument("-utter", "--utterancesPerSpeaker", default=5, type=int)
 
-base_dir = "../data/audio/train"
-model_dir = "../data/model"
 
-# base_dir = "../input/real-time-voice-cloning/train"
-# model_dir = "./model"
+parser.add_argument("-e", "--epochs", default=20, type=int)
+parser.add_argument("-v", "--version", default="v00")
 
-if not os.path.exists(model_dir): os.makedirs(model_dir)
+parser.add_argument("-limt", "--limitTrain", default="30")
+parser.add_argument("-limv", "--limitValid", default="20")
 
-## UTILS
+parser.add_argument("-se", "--saveEvery", default="100")
+parser.add_argument("-sm", "--saveModel", action="store_true")
+
+args = parser.parse_args()
+
+## UTILS   
+get_limit = lambda val, total: int(val) if val.isdigit() else float(val) * total
+
 class RandomCycler:
     def __init__(self, source):
         self.all_items = list(source)
@@ -148,22 +158,28 @@ class SpeakerVerificationDataLoader(DataLoader):
 
 ## MODEL
 class SpeakerEncoder(nn.Module):
-    def __init__(self, device, loss_device):
+    def __init__(
+        self, 
+        hidden_size=args.hiddenSize,
+        num_layers=args.nlayers,
+        learning_rate = args.learningRate,
+        ):
         super().__init__()
-        self.loss_device = loss_device
+        self.loss_device = LOSS_DEVICE
         
         self.lstm = nn.LSTM(input_size=MEL_N_CHANNELS,
-                            hidden_size=model_hidden_size, 
-                            num_layers=model_num_layers, 
-                            batch_first=True).to(device)
-        self.linear = nn.Linear(in_features=model_hidden_size, 
-                                out_features=MODEL_EM_size).to(device)
-        self.relu = torch.nn.ReLU().to(device)
+                            hidden_size=hidden_size, 
+                            num_layers=num_layers, 
+                            batch_first=True).to(DEVICE)
+        self.linear = nn.Linear(in_features=hidden_size, 
+                                out_features=MODEL_EM_size).to(DEVICE)
+        self.relu = torch.nn.ReLU().to(DEVICE)
         
-        self.similarity_weight = nn.Parameter(torch.tensor([10.])).to(loss_device)
-        self.similarity_bias = nn.Parameter(torch.tensor([-5.])).to(loss_device)
+        self.similarity_weight = nn.Parameter(torch.tensor([10.])).to(self.loss_device)
+        self.similarity_bias = nn.Parameter(torch.tensor([-5.])).to(self.loss_device)
 
-        self.loss_fn = nn.CrossEntropyLoss().to(loss_device)
+        self.loss_fn = nn.CrossEntropyLoss().to(self.loss_device)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         
     def do_gradient_ops(self):
         self.similarity_weight.grad *= 0.01
@@ -218,108 +234,152 @@ class SpeakerEncoder(nn.Module):
             
         return loss, eer
 
-
 def sync(device: torch.device):
     if device.type == "cuda": torch.cuda.synchronize(device)
-    
 
-def train(
-    run_id=version, 
-    clean_data_root=base_dir, 
-    models_dir=model_dir, 
-    save_every=save_every, 
-    ):
-    dataset = SpeakerVerificationDataset(clean_data_root)
-    loader = SpeakerVerificationDataLoader(
-        dataset,
-        speakers_per_batch,
-        utterances_per_speaker,
-        num_workers=WORKERS
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss_device = torch.device("cpu")
-
-    model = SpeakerEncoder(device, loss_device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate_init)
-    init_step = 1
-
-    state_fpath = f"{models_dir}/encoder_{run_id}.pt"
-    if os.path.isfile(state_fpath):
+def run(run_id, train_dl, valid_dl, model, epoch=0):
+    step = 0   
+    state_fpath = f"{args.modelDir}/encoder_{run_id}.pt"
+    if os.path.isfile(state_fpath) and args.saveModel:
         checkpoint = torch.load(state_fpath)
-        init_step = checkpoint["step"]
+        step = checkpoint["step"]
         model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        optimizer.param_groups[0]["lr"] = learning_rate_init   
+        model.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        model.optimizer.param_groups[0]["lr"] = learning_rate_init   
 
     model.train()
 
     res = {
-        "loss":[], 
-        "eer":[]
+        "loss":0, 
+        "eer":0,
+        "val_loss": 0,
+        "val_eer": 0,
     }
-    for step, speaker_batch in enumerate(loader, init_step):
 
-        # Forward pass
-        inputs = torch.from_numpy(speaker_batch.data).to(device)
-        sync(device)
+    i = 0
+    bsize = get_limit(args.limitTrain, len(train_dl)) 
+    cur_limit = bsize
+    cur_epoch = ( '0' * (len(str(args.epochs))-len(str(epoch))) + str(epoch))
+    loadbar(i, bsize, f"Epoch: [{cur_epoch}/{args.epochs}]  {i}/{bsize}", length=50)
+    for idx, speaker_batch in enumerate(train_dl):
+        if idx > cur_limit-1: break
+
+        # Forward pass - Training
+        inputs = torch.from_numpy(speaker_batch.data).to(DEVICE)
+        sync(DEVICE)
 
         embeds = model(inputs)
-        sync(device)
+        sync(DEVICE)
 
-        embeds_loss = embeds.view((speakers_per_batch, utterances_per_speaker, -1)).to(loss_device)
+        embeds_loss = embeds.view((args.speakersPerBatch, args.utterancesPerSpeaker, -1)).to(LOSS_DEVICE)
         loss, eer = model.loss(embeds_loss)
-
-        res["loss"].append(loss)
-        res["eer"].append(eer)
-        print(f"step:{step} - Loss:{loss:0.4f} - EER:{eer:0.4f}")
-
-        sync(loss_device)
+        
+        sync(LOSS_DEVICE)
 
         # Backward pass
         model.zero_grad()
         loss.backward()
 
         model.do_gradient_ops()
-        optimizer.step()
+        model.optimizer.step()
+
+        res["loss"] += loss.detach().item()
+        res["eer"] += eer
+        
+        cur_batch = ( '0' * (len(str(bsize))-len(str(i+1))) + str(i+1))
+        p = f"Epoch [{cur_epoch}/{args.epochs}] {cur_batch}/{bsize}"
+        
+        if i+1 == bsize:
+            cur_limit = get_limit(args.limitValid, len(valid_dl))
+            cur_batch = ( '0' * (len(str(bsize))-len(str(i))) + str(i))
+            s = f"- loss:{res['loss']/bsize:0.4f} - eer:{res['eer']/bsize:0.4f}"
+            loadbar(i-1, bsize, p, s, length=50)
+            for idx, speaker_batch in enumerate(valid_dl):
+
+                if idx > bsize-1: break
+
+                # Forward pass - Validating
+                inputs = torch.from_numpy(speaker_batch.data).to(DEVICE)
+                sync(DEVICE)
+
+                embeds = model(inputs)
+                sync(DEVICE)
+
+                embeds_loss = embeds.view((args.speakersPerBatch, args.utterancesPerSpeaker, -1)).to(LOSS_DEVICE)
+                loss, eer = model.loss(embeds_loss)
+
+                sync(LOSS_DEVICE)
+                
+                res["val_loss"] += loss
+                res["val_eer"] += eer
+                                
+                e = f" - val_loss:{loss:0.4f} - val_eer:{eer:0.4f}"
+                loadbar(i-1, bsize, p, s+e, length=50)
+                  
+            cur_batch = ( '0' * (len(str(bsize))-len(str(i+1))) + str(i+1))
+            # p = f"Epoch [{cur_epoch}/{epochs}] {cur_batch}/{bsize}"
+            e = f" - val_loss:{res['val_loss']/bsize:0.4f} - val_eer:{res['val_eer']/bsize:0.4f}"
+            loadbar(i+1, bsize, p, s+e, length=50)
+        else:
+            s = f"- loss:{loss:0.4f} - eer:{eer:0.4f}"
+            loadbar(i+1, bsize, p, s, length=50)
+            
+        i+=1
 
         # Overwrite the latest version of the model
-        if save_every != 0 and step % save_every == 0:
-            print("Saving the model (step %d)" % step)
+        save_every = get_limit(args.saveEvery, len(train_dl))
+        if save_every != 0 and step % save_every == 0 and args.saveModel:
             torch.save({
-                "step": step + 1,
+                "step": step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
             }, state_fpath)
 
-    return np.mean(res["loss"]), np.mean(res["eer"])
+        step += 1
 
-for epoch in range(epochs): 
-    loss, eer = train()
-    print(f"Epoch:{epoch}/{epochs} - Loss:{loss:0.4f} - EER:{eer:0.4f}")
+def train():
+    train_dl = SpeakerVerificationDataLoader(
+        SpeakerVerificationDataset(args.baseDir + "/train"),
+        args.speakersPerBatch,
+        args.utterancesPerSpeaker,
+        num_workers=WORKERS
+    )
+
+    valid_dl = SpeakerVerificationDataLoader(
+        SpeakerVerificationDataset(args.baseDir + "/val"),
+        args.speakersPerBatch,
+        args.utterancesPerSpeaker,
+        num_workers=WORKERS
+    )
+
+    model=SpeakerEncoder()
+
+    for epoch in range(args.epochs): run(args.version, train_dl, valid_dl, model, epoch)
 
 
+train()
 
+# #-----------------------------------------------------------------
 
-    
+def testutils():
+    base_dir = "../data/audio/train"
 
-## Testing Utils 
-# base_dir = "../data/audio/train"
+    utter = Utterance(glob(base_dir + "/1272/*")[0])
+    arr = utter.get_frames()
+    print(arr.shape)
+    arr, _ = utter.random_partial(PAR_N_FRAMES)
+    print(arr.shape)
 
-# utter = Utterance(glob(base_dir + "/1272/*")[0])
-# arr = utter.get_frames()
-# print(arr.shape)
-# arr, _ = utter.random_partial(PAR_N_FRAMES)
-# print(arr.shape)
+    spkr = Speaker(glob(base_dir + "/*")[0])
+    _, arr, _ = spkr.random_partial(4, PAR_N_FRAMES)[0] 
+    print(arr.shape)
 
-# spkr = Speaker(glob(base_dir + "/*")[0])
-# _, arr, _ = spkr.random_partial(4, PAR_N_FRAMES)[0] 
-# print(arr.shape)
+    speakers = [Speaker(spath) for spath in glob(base_dir+"/*")][:3]
+    batch = SpeakerBatch(speakers, 4, PAR_N_FRAMES)
+    print(batch.data.shape)
 
-# speakers = [Speaker(spath) for spath in glob(base_dir+"/*")][:3]
-# batch = SpeakerBatch(speakers, 4, PAR_N_FRAMES)
-# print(batch.data.shape)
+    dl = SpeakerVerificationDataLoader(SpeakerVerificationDataset(args.baseDir), 4, 5)
+    _, arr, _ = dl.dataset.__getitem__(1).random_partial(4, 160)[0]
+    print(arr.shape)
 
-# dl = SpeakerVerificationDataLoader(SpeakerVerificationDataset(base_dir), 4, 5)
-# _, arr, _ = dl.dataset.__getitem__(1).random_partial(4, 160)[0]
-# print(arr.shape)
+# testutils()
