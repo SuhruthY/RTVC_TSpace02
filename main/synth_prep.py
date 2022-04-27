@@ -23,7 +23,10 @@
 # logger.info(f"Project Name: RTVC - Model Name: Synthesizer - Stage Name: Preprocessing")
 
 #---------------------------------------------------------
+import torch
+from enc import embed_frames_batch
 
+#----------------------------------------------------
 from glob import glob
 
 import numpy as np
@@ -124,17 +127,18 @@ def text_to_seq(text):
     return seq 
 
 
-# for idx, text in list(data.items())[:10]:
-
-#     text = text_to_seq(text)
-
-#     print(idx, text)
-
 for path in glob("../data/audio/*/*/*"):
     idx = path.split("/")[-1].split(".")[0]
+
     text = np.array(text_to_seq(data[idx]))
 
     arr = np.load(path)
+
+    embeds = embed_frames_batch(arr)
+
+    print(arr.shape, text.shape, embed.shape)
+
+    break
 
     
 

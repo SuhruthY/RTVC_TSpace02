@@ -2,12 +2,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
-# import time
 import random
 import argparse
 import numpy as np
 
 from glob import glob
+
 from utils import *
 
 import torch
@@ -19,11 +19,15 @@ from sklearn.metrics import roc_curve
 from torch.nn.utils import clip_grad_norm_
 from scipy.optimize import brentq
 
-# GLOBAL VARS
+## ----- GLOBAL PARAMS -----------------------------------
+# CONSTANTS
+SAMPLE_RATE = 16000
 PAR_N_FRAMES = 160
-MODEL_EM_size = 256
-MEL_N_CHANNELS = 40
+MODEL_EM_SIZE = 256
+MEL_N_CHANNEL = 40
+MEL_WNDW_STEP = 10  
 
+# VARS
 WORKERS = torch.cuda.device_count() if torch.cuda.is_available() else os.cpu_count()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,6 +38,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("-bdir", "--baseDir", default="../data/audio")
 parser.add_argument("-mdir", "--modelDir", default="../data/model")
+parser.add_argument("-ptdir", "--pretrainedDir", default="../data/pretrained_models")
 
 parser.add_argument("-hs", "--hiddenSize", default=256, type=int)
 parser.add_argument("-nl", "--nlayers", default=3, type=int)
@@ -52,7 +57,15 @@ parser.add_argument("-limv", "--limitValid", default="20")
 parser.add_argument("-se", "--saveEvery", default="100")
 parser.add_argument("-sm", "--saveModel", action="store_true")
 
+task = parser.add_mutually_exclusive_group()
+task.add_argument('-train', action='store_true')
+task.add_argument('-tune', action='store_true')
+task.add_argument('-test', action='store_true')
+task.add_argument('-ftest', action='store_true')
+
 args = parser.parse_args()
+
+# print(args)
 
 ## UTILS   
 get_limit = lambda val, total: int(val) if val.isdigit() else float(val) * total
@@ -167,12 +180,12 @@ class SpeakerEncoder(nn.Module):
         super().__init__()
         self.loss_device = LOSS_DEVICE
         
-        self.lstm = nn.LSTM(input_size=MEL_N_CHANNELS,
+        self.lstm = nn.LSTM(input_size=MEL_N_CHANNEL,
                             hidden_size=hidden_size, 
                             num_layers=num_layers, 
                             batch_first=True).to(DEVICE)
         self.linear = nn.Linear(in_features=hidden_size, 
-                                out_features=MODEL_EM_size).to(DEVICE)
+                                out_features=MODEL_EM_SIZE).to(DEVICE)
         self.relu = torch.nn.ReLU().to(DEVICE)
         
         self.similarity_weight = nn.Parameter(torch.tensor([10.])).to(self.loss_device)
@@ -234,6 +247,7 @@ class SpeakerEncoder(nn.Module):
             
         return loss, eer
 
+## TRAINING UTILS
 def sync(device: torch.device):
     if device.type == "cuda": torch.cuda.synchronize(device)
 
@@ -356,13 +370,9 @@ def train():
 
     for epoch in range(args.epochs): run(args.version, train_dl, valid_dl, model, epoch)
 
-
-train()
-
-# #-----------------------------------------------------------------
-
+## FUNCTIONAILTY TEST UTILS
 def testutils():
-    base_dir = "../data/audio/train"
+    base_dir = args.baseDir + "/train"
 
     utter = Utterance(glob(base_dir + "/1272/*")[0])
     arr = utter.get_frames()
@@ -378,8 +388,88 @@ def testutils():
     batch = SpeakerBatch(speakers, 4, PAR_N_FRAMES)
     print(batch.data.shape)
 
-    dl = SpeakerVerificationDataLoader(SpeakerVerificationDataset(args.baseDir), 4, 5)
+    dl = SpeakerVerificationDataLoader(SpeakerVerificationDataset(base_dir), 4, 5)
     _, arr, _ = dl.dataset.__getitem__(1).random_partial(4, 160)[0]
     print(arr.shape)
 
-# testutils()
+## INFERENCE
+def load_model(weights_fpath):
+    model = SpeakerEncoder()
+    checkpoint = torch.load(weights_fpath, DEVICE)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    print(f"Loaded encoder encoder.pt - trained to step {checkpoint['step']}")
+
+def is_loaded():
+    return model is None
+
+def embed_frames_batch(frames_batch):
+    if not is_loaded(): load_model(args.pretrainedDir + "/encoder.pt")
+
+    frames = torch.from_numpy(frames_batch).to(DEVICE)
+    embed = model.forward(frames).detach().cpu().numpy()
+    return embed
+
+## To Implement - use original wav files
+# def compute_partial_slices(
+#     n_samples, 
+#     partial_utterance_n_frames=PAR_N_FRAMES,
+#     min_pad_coverage=0.75, overlap=0.5):
+
+#     assert 0 <= overlap < 1
+#     assert 0 < min_pad_coverage <= 1
+
+#     samples_per_frame = int((SAMPLE_RATE * MEL_WNDW_STEP / 1000))
+#     n_frames = int(np.ceil((n_samples + 1) / samples_per_frame))
+#     frame_step = max(int(np.round(partial_utterance_n_frames * (1 - overlap))), 1)
+
+#     # Compute the slices
+#     wav_slices, mel_slices = [], []
+#     steps = max(1, n_frames - partial_utterance_n_frames + frame_step + 1)
+#     for i in range(0, steps, frame_step):
+#         mel_range = np.array([i, i + partial_utterance_n_frames])
+#         wav_range = mel_range * samples_per_frame
+#         mel_slices.append(slice(*mel_range))
+#         wav_slices.append(slice(*wav_range))
+
+#     # Evaluate whether extra padding is warranted or not
+#     last_wav_range = wav_slices[-1]
+#     coverage = (n_samples - last_wav_range.start) / (last_wav_range.stop - last_wav_range.start)
+#     if coverage < min_pad_coverage and len(mel_slices) > 1:
+#         mel_slices = mel_slices[:-1]
+#         wav_slices = wav_slices[:-1]
+
+#     return wav_slices, mel_slices
+
+
+# def embed_utterance(wav, using_partials=True, return_partials=False, **kwargs):
+#     # Process the entire utterance if not using partials
+#     if not using_partials:
+#         # frames = audio.wav_to_mel_spectrogram(wav)
+#         embed = embed_frames_batch(frames[None, ...])[0]
+#         if return_partials:
+#             return embed, None, None
+#         return embed
+
+#     # Compute where to split the utterance into partials and pad if necessary
+#     wave_slices, mel_slices = compute_partial_slices(len(wav), **kwargs)
+#     max_wave_length = wave_slices[-1].stop
+#     if max_wave_length >= len(wav):
+#         wav = np.pad(wav, (0, max_wave_length - len(wav)), "constant")
+
+#     # Split the utterance into partials
+#     # frames = audio.wav_to_mel_spectrogram(wav)
+#     frames_batch = np.array([frames[s] for s in mel_slices])
+#     partial_embeds = embed_frames_batch(frames_batch)
+
+#     # Compute the utterance embedding from the partial embeddings
+#     raw_embed = np.mean(partial_embeds, axis=0)
+#     embed = raw_embed / np.linalg.norm(raw_embed, 2)
+
+#     if return_partials:
+#         return embed, partial_embeds, wave_slices
+#     return embed
+
+
+if args.train: train()
+if args.ftest: testutils()
